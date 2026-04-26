@@ -1,0 +1,17 @@
+# repotrace local artifacts
+.repotrace/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# os
+.DS_Store
