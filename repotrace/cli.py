@@ -171,24 +171,42 @@ def _fmt_impact(d: dict) -> None:
 
 
 def _fmt_deps(d: dict) -> None:
-    s = d["summary"]
-    print(
-        f"Python files={s['python_files']}  resolved_edges={s['resolved_edges']}  "
-        f"unresolved_imports={s['unresolved_imports']}"
+    s = d.get("summary", {}) or {}
+    # Support both legacy ("python_files") and current multi-language summary keys.
+    files = (
+        s.get("files")
+        if "files" in s
+        else s.get("code_files", s.get("python_files", 0))
     )
+    resolved = s.get("resolved_edges", 0)
+    unresolved = s.get("unresolved_imports", 0)
+    print(
+        f"files={files}  resolved_edges={resolved}  unresolved_imports={unresolved}"
+    )
+    languages = s.get("languages") or d.get("languages")
+    if languages:
+        if isinstance(languages, dict):
+            parts = ", ".join(f"{k}={v}" for k, v in sorted(languages.items()))
+        else:
+            parts = ", ".join(str(x) for x in languages)
+        print(f"languages: {parts}")
     print()
     print("Most imported modules:")
-    for node in sorted(d["nodes"], key=lambda n: n["imported_by"], reverse=True)[:15]:
-        if node["imported_by"]:
-            marker = " [test]" if node["is_test"] else ""
+    for node in sorted(
+        d.get("nodes", []),
+        key=lambda n: n.get("imported_by", 0),
+        reverse=True,
+    )[:15]:
+        if node.get("imported_by"):
+            marker = " [test]" if node.get("is_test") else ""
             print(f"  {node['imported_by']:>4}  {node['path']}{marker}")
 
 
 def _fmt_cycles(d: dict) -> None:
     if not d["cycles"]:
-        print("No Python import cycles detected.")
+        print("No import cycles detected.")
         return
-    print(f"Detected {d['cycle_count']} Python import cycle(s):")
+    print(f"Detected {d['cycle_count']} import cycle(s):")
     for i, cycle in enumerate(d["cycles"], start=1):
         print(f"\nCycle {i}:")
         for path in cycle:
@@ -223,7 +241,7 @@ def _fmt_check(d: dict) -> None:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="repotrace",
-        description="Local-first code intelligence (Python AST + SQLite).",
+        description="Local-first code intelligence (multi-language + SQLite).",
     )
     p.add_argument("--json", action="store_true", help="emit JSON instead of text")
     p.add_argument(
@@ -260,7 +278,7 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("file", help="file outline (symbols + imports)")
     sp.add_argument("path")
 
-    sub.add_parser("routes", help="HTTP routes (Python decorators)")
+    sub.add_parser("routes", help="HTTP routes (decorators / app.METHOD calls)")
 
     sp = sub.add_parser("changed", help="symbols in files changed since a git ref")
     sp.add_argument("--since", default="main")
@@ -269,9 +287,9 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("target")
     sp.add_argument("--depth", type=int, default=2)
 
-    sub.add_parser("deps", help="Python import graph summary")
+    sub.add_parser("deps", help="import graph summary")
 
-    sp = sub.add_parser("cycles", help="detect Python import cycles")
+    sp = sub.add_parser("cycles", help="detect import cycles")
     sp.add_argument("--limit", type=int, default=50)
 
     sp = sub.add_parser("check", help="architecture checks; exits nonzero on errors")
