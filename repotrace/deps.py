@@ -1,12 +1,34 @@
-"""Import graph, cycle detection, and architectural checks."""
+"""Language-agnostic import graph, cycle detection, and architectural checks."""
 
 from __future__ import annotations
 
 from collections import defaultdict
-from pathlib import Path
+from pathlib import PurePosixPath, Path
 from typing import Iterable
 
 from . import db
+
+CODE_LANGUAGES = {
+    "python",
+    "javascript",
+    "typescript",
+    "go",
+    "rust",
+    "java",
+    "kotlin",
+    "swift",
+    "c",
+    "cpp",
+    "csharp",
+    "ruby",
+    "php",
+}
+
+JS_TS_EXTS = (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
+RUST_EXTS = (".rs",)
+RUBY_EXTS = (".rb",)
+PHP_EXTS = (".php",)
+C_EXTS = (".h", ".hpp", ".hh", ".hxx", ".c", ".cc", ".cpp", ".cxx")
 
 
 def _is_python(path: str) -> bool:
@@ -15,20 +37,80 @@ def _is_python(path: str) -> bool:
 
 def _is_test_file(path: str) -> bool:
     name = Path(path).name
-    return path.startswith("tests/") or "/tests/" in path or name.startswith("test_")
+    return (
+        path.startswith("tests/")
+        or "/tests/" in path
+        or name.startswith("test_")
+        or name.endswith("_test.go")
+        or name.endswith(".test.js")
+        or name.endswith(".test.jsx")
+        or name.endswith(".test.ts")
+        or name.endswith(".test.tsx")
+        or name.endswith(".spec.js")
+        or name.endswith(".spec.jsx")
+        or name.endswith(".spec.ts")
+        or name.endswith(".spec.tsx")
+        or "/src/test/" in path
+        or "/__tests__/" in path
+    )
 
 
-def _module_for_path(path: str) -> str | None:
-    if not _is_python(path):
-        return None
-    stem = path.rsplit(".", 1)[0].replace("/", ".")
-    if stem.endswith(".__init__"):
-        return stem[: -len(".__init__")]
+def _strip_suffix(path: str) -> str:
+    return path.rsplit(".", 1)[0] if "." in Path(path).name else path
+
+
+def _without_common_source_root(stem: str) -> str:
+    prefixes = (
+        "src/main/java/",
+        "src/test/java/",
+        "src/main/kotlin/",
+        "src/test/kotlin/",
+        "app/src/main/java/",
+        "app/src/test/java/",
+        "app/src/main/kotlin/",
+        "app/src/test/kotlin/",
+        "Sources/",
+        "Tests/",
+        "src/",
+    )
+    for prefix in prefixes:
+        if stem.startswith(prefix):
+            return stem[len(prefix) :]
     return stem
 
 
+def _module_for_path(path: str, language: str | None = None) -> str | None:
+    if language == "python" or (language is None and _is_python(path)):
+        stem = path.rsplit(".", 1)[0].replace("/", ".")
+        if stem.endswith(".__init__"):
+            return stem[: -len(".__init__")]
+        return stem
+
+    stem = _strip_suffix(path)
+    if language in {"javascript", "typescript"}:
+        if stem.endswith("/index"):
+            stem = stem[: -len("/index")]
+        return stem.replace("/", ".")
+    if language == "go":
+        parent = str(PurePosixPath(path).parent)
+        return "" if parent == "." else parent
+    if language == "rust":
+        if path in {"src/lib.rs", "src/main.rs"}:
+            return "crate"
+        if stem.endswith("/mod"):
+            stem = stem[: -len("/mod")]
+        if stem.startswith("src/"):
+            stem = stem[len("src/") :]
+        return stem.replace("/", "::")
+    if language in {"java", "kotlin", "swift", "csharp", "php"}:
+        return _without_common_source_root(stem).replace("/", ".").replace("\\", ".")
+    if language in {"c", "cpp", "ruby"}:
+        return stem.replace("/", ".")
+    return None
+
+
 def _package_for_path(path: str) -> str:
-    module = _module_for_path(path) or ""
+    module = _module_for_path(path, "python") or ""
     if path.endswith("/__init__.py"):
         return module
     return module.rsplit(".", 1)[0] if "." in module else ""
@@ -56,38 +138,228 @@ def _resolve_absolute(module: str, imported_name: str | None) -> list[str]:
     return candidates
 
 
-def _best_module_match(candidates: Iterable[str], module_to_path: dict[str, str]) -> str | None:
+def _best_module_match(candidates: Iterable[str], module_to_paths: dict[str, list[str]]) -> str | None:
     matches: list[str] = []
     for candidate in candidates:
-        parts = candidate.split(".")
+        cleaned = candidate.strip().strip(";").replace("::", ".").replace("/", ".")
+        if cleaned.endswith(".*"):
+            cleaned = cleaned[: -len(".*")]
+        parts = cleaned.split(".")
         for i in range(len(parts), 0, -1):
             prefix = ".".join(parts[:i])
-            if prefix in module_to_path:
+            if prefix in module_to_paths:
                 matches.append(prefix)
     if not matches:
         return None
     return max(matches, key=lambda m: (m.count("."), len(m)))
 
 
+def _normalize_posix(path: PurePosixPath | str) -> str:
+    return str(PurePosixPath(str(path)))
+
+
+def _first_existing(candidates: Iterable[str], files_by_path: dict[str, dict]) -> str | None:
+    for candidate in candidates:
+        normalized = _normalize_posix(candidate)
+        if normalized in files_by_path:
+            return normalized
+    return None
+
+
+def _resolve_path_like(
+    source_path: str,
+    module: str,
+    files_by_path: dict[str, dict],
+    extensions: Iterable[str],
+    *,
+    relative_to_source: bool = True,
+) -> str | None:
+    spec = module.strip().strip("'").strip('"')
+    if not spec:
+        return None
+    bases: list[PurePosixPath] = []
+    spec_path = PurePosixPath(spec)
+    if relative_to_source and spec.startswith("."):
+        bases.append(PurePosixPath(source_path).parent / spec_path)
+    bases.append(spec_path)
+
+    candidates: list[str] = []
+    for base in bases:
+        candidates.append(str(base))
+        for ext in extensions:
+            candidates.append(str(base) + ext)
+        for ext in extensions:
+            candidates.append(str(base / ("index" + ext)))
+            candidates.append(str(base / ("mod" + ext)))
+    return _first_existing(candidates, files_by_path)
+
+
+def _representative_file_in_dir(
+    directory: str,
+    files_by_path: dict[str, dict],
+    language: str,
+) -> str | None:
+    prefix = "" if directory in {"", "."} else directory.rstrip("/") + "/"
+    matches = [
+        path
+        for path, row in files_by_path.items()
+        if row["language"] == language
+        and str(PurePosixPath(path).parent) == (directory or ".")
+    ]
+    if not matches and prefix:
+        matches = [
+            path
+            for path, row in files_by_path.items()
+            if row["language"] == language and path.startswith(prefix)
+        ]
+    if not matches:
+        return None
+    return sorted(matches, key=lambda p: (_is_test_file(p), len(p), p))[0]
+
+
+def _resolve_go_import(module: str, files_by_path: dict[str, dict]) -> str | None:
+    spec = module.strip().strip('"')
+    if not spec:
+        return None
+    dirs = sorted(
+        {
+            str(PurePosixPath(path).parent)
+            for path, row in files_by_path.items()
+            if row["language"] == "go"
+        },
+        key=lambda d: (-len(d), d),
+    )
+    for directory in dirs:
+        if directory == ".":
+            continue
+        if spec == directory or spec.endswith("/" + directory) or directory.endswith("/" + spec):
+            target = _representative_file_in_dir(directory, files_by_path, "go")
+            if target:
+                return target
+    return None
+
+
+def _resolve_rust_import(source_path: str, module: str, files_by_path: dict[str, dict]) -> str | None:
+    cleaned = module.strip().strip(";")
+    cleaned = cleaned.split(" as ", 1)[0].strip()
+    cleaned = cleaned.replace("{", "::").replace("}", "")
+    cleaned = cleaned.replace("self::", "")
+    parts = [p for p in cleaned.split("::") if p and p != "*"]
+    if not parts:
+        return None
+
+    source = PurePosixPath(source_path)
+    source_dir = source.parent
+    if source.name in {"lib.rs", "main.rs", "mod.rs"}:
+        module_dir = source_dir
+    else:
+        module_dir = source_dir
+
+    if parts[0] == "crate":
+        base = PurePosixPath("src").joinpath(*parts[1:])
+    elif parts[0] == "super":
+        rest = parts[1:]
+        base = module_dir.parent.joinpath(*rest)
+    else:
+        base = module_dir.joinpath(*parts)
+
+    candidates: list[str] = []
+    # use paths often include an item inside the module; try longest module prefix first.
+    base_parts = list(base.parts)
+    for i in range(len(base_parts), 0, -1):
+        prefix = PurePosixPath(*base_parts[:i])
+        candidates.append(str(prefix) + ".rs")
+        candidates.append(str(prefix / "mod.rs"))
+    return _first_existing(candidates, files_by_path)
+
+
+def _resolve_c_include(source_path: str, module: str, files_by_path: dict[str, dict]) -> str | None:
+    target = _resolve_path_like(source_path, module, files_by_path, C_EXTS, relative_to_source=True)
+    if target:
+        return target
+    basename = PurePosixPath(module).name
+    matches = [
+        path
+        for path in files_by_path
+        if PurePosixPath(path).name == basename
+    ]
+    return sorted(matches, key=lambda p: (len(p), p))[0] if matches else None
+
+
+def _resolve_import(imp: dict, files_by_path: dict[str, dict], module_to_paths: dict[str, list[str]]) -> str | None:
+    source = imp["source"]
+    language = imp["language"]
+    module = imp["module"] or ""
+    imported_name = imp.get("imported_name")
+    level = imp.get("level") or 0
+
+    if language == "python":
+        candidates = (
+            _resolve_relative(source, module, imported_name, level)
+            if level
+            else _resolve_absolute(module, imported_name)
+        )
+        target_module = _best_module_match(candidates, module_to_paths)
+        return module_to_paths[target_module][0] if target_module else None
+
+    if language in {"javascript", "typescript"}:
+        if module.startswith(".") or module.startswith("/"):
+            return _resolve_path_like(source, module, files_by_path, JS_TS_EXTS, relative_to_source=True)
+        # Simple support for path aliases/monorepo imports that mirror repo paths.
+        return _resolve_path_like(source, module, files_by_path, JS_TS_EXTS, relative_to_source=False)
+
+    if language == "go":
+        return _resolve_go_import(module, files_by_path)
+
+    if language == "rust":
+        return _resolve_rust_import(source, module, files_by_path)
+
+    if language in {"java", "kotlin", "csharp", "php"}:
+        candidates = [module]
+        if imported_name:
+            candidates.append(f"{module}.{imported_name}")
+        target_module = _best_module_match(candidates, module_to_paths)
+        return module_to_paths[target_module][0] if target_module else None
+
+    if language == "swift":
+        target_module = _best_module_match([module], module_to_paths)
+        return module_to_paths[target_module][0] if target_module else None
+
+    if language in {"c", "cpp"}:
+        return _resolve_c_include(source, module, files_by_path)
+
+    if language == "ruby":
+        return _resolve_path_like(source, module, files_by_path, RUBY_EXTS, relative_to_source=True)
+
+    return None
+
+
 def import_graph(repo_root: Path) -> dict:
-    """Build a Python import graph from indexed files/imports."""
+    """Build a language-agnostic import/dependency graph from indexed files/imports."""
     conn = db.connect(repo_root)
     file_rows = conn.execute(
-        "SELECT id, path, line_count FROM files WHERE language = 'python' ORDER BY path"
+        "SELECT id, path, language, line_count FROM files "
+        "WHERE language IN ({}) ORDER BY path".format(
+            ",".join("?" for _ in CODE_LANGUAGES)
+        ),
+        tuple(sorted(CODE_LANGUAGES)),
     ).fetchall()
     files_by_id = {r["id"]: dict(r) for r in file_rows}
-    module_to_path: dict[str, str] = {}
+    files_by_path = {r["path"]: dict(r) for r in file_rows}
+
+    module_to_paths: dict[str, list[str]] = defaultdict(list)
     path_to_module: dict[str, str] = {}
     for row in file_rows:
-        module = _module_for_path(row["path"])
-        if module:
-            module_to_path[module] = row["path"]
+        module = _module_for_path(row["path"], row["language"])
+        if module is not None:
+            module_to_paths[module].append(row["path"])
             path_to_module[row["path"]] = module
 
     import_rows = conn.execute(
-        "SELECT i.file_id, i.module, i.imported_name, i.alias, i.level, i.line, f.path AS source "
+        "SELECT i.file_id, i.module, i.imported_name, i.alias, i.level, i.line, "
+        "       f.path AS source, f.language AS language "
         "FROM imports i JOIN files f ON i.file_id = f.id "
-        "WHERE f.language = 'python' ORDER BY f.path, i.line"
+        "ORDER BY f.path, i.line"
     ).fetchall()
     conn.close()
 
@@ -96,41 +368,38 @@ def import_graph(repo_root: Path) -> dict:
     adjacency: dict[str, set[str]] = defaultdict(set)
     reverse: dict[str, set[str]] = defaultdict(set)
 
-    for imp in import_rows:
+    for row in import_rows:
+        imp = dict(row)
         source = imp["source"]
-        source_module = path_to_module.get(source)
-        if not source_module:
+        if source not in files_by_path:
             continue
-        level = imp["level"] or 0
-        candidates = (
-            _resolve_relative(source, imp["module"] or "", imp["imported_name"], level)
-            if level
-            else _resolve_absolute(imp["module"] or "", imp["imported_name"])
-        )
-        target_module = _best_module_match(candidates, module_to_path)
-        if not target_module:
+        target = _resolve_import(imp, files_by_path, module_to_paths)
+        if not target:
             unresolved.append(
                 {
                     "source": source,
+                    "language": imp["language"],
                     "line": imp["line"],
                     "module": imp["module"],
                     "imported_name": imp["imported_name"],
-                    "level": level,
+                    "level": imp["level"] or 0,
                 }
             )
             continue
-        target = module_to_path[target_module]
         if target == source:
             continue
+        target_row = files_by_path[target]
         edge = {
             "source": source,
-            "source_module": source_module,
+            "source_module": path_to_module.get(source),
+            "source_language": imp["language"],
             "target": target,
-            "target_module": target_module,
+            "target_module": path_to_module.get(target),
+            "target_language": target_row["language"],
             "line": imp["line"],
             "module": imp["module"],
             "imported_name": imp["imported_name"],
-            "level": level,
+            "level": imp["level"] or 0,
             "source_is_test": _is_test_file(source),
             "target_is_test": _is_test_file(target),
         }
@@ -141,6 +410,7 @@ def import_graph(repo_root: Path) -> dict:
     nodes = [
         {
             "path": r["path"],
+            "language": r["language"],
             "module": path_to_module.get(r["path"]),
             "line_count": r["line_count"],
             "is_test": _is_test_file(r["path"]),
@@ -149,6 +419,9 @@ def import_graph(repo_root: Path) -> dict:
         }
         for r in file_rows
     ]
+    languages: dict[str, int] = defaultdict(int)
+    for node in nodes:
+        languages[node["language"] or "unknown"] += 1
 
     return {
         "repo_root": str(repo_root),
@@ -156,7 +429,8 @@ def import_graph(repo_root: Path) -> dict:
         "edges": edges,
         "unresolved": unresolved,
         "summary": {
-            "python_files": len(nodes),
+            "files": len(nodes),
+            "languages": dict(sorted(languages.items())),
             "resolved_edges": len(edges),
             "unresolved_imports": len(unresolved),
         },
@@ -222,7 +496,7 @@ def check(repo_root: Path, *, max_lines: int = 1000, cycle_limit: int = 50) -> d
             {
                 "severity": "error",
                 "code": "import-cycle",
-                "message": "Python import cycle detected",
+                "message": "Import cycle detected",
                 "files": cycle,
             }
         )
