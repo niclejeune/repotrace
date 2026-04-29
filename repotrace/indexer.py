@@ -311,6 +311,48 @@ def _decorators_to_strs(decorators: list[ast.expr]) -> list[str]:
     return out
 
 
+
+# Next.js App Router detection
+NEXT_HTTP_METHODS = {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}
+NEXT_ROUTE_FILE_RE = re.compile(r"^route\.(ts|tsx|js|jsx|mjs|cjs)$")
+
+
+def _next_app_route_path(path: Path) -> Optional[str]:
+    """Return derived URL path for a Next.js App Router handler, or None.
+
+    Triggers when the file is named ``route.{ts,tsx,js,jsx,mjs,cjs}`` and lives
+    under an ``app/`` directory. The URL path is the segment list between
+    ``app/`` and the file's parent, with Next.js conventions applied:
+    ``[id]`` -> ``:id``, ``[...slug]`` and ``[[...slug]]`` -> ``*slug``,
+    route groups ``(name)`` and parallel routes ``@name`` are stripped.
+    """
+    if not NEXT_ROUTE_FILE_RE.match(path.name):
+        return None
+    parts = path.parts
+    app_idx = None
+    for i, p_ in enumerate(parts):
+        if p_ == "app":
+            app_idx = i
+    if app_idx is None:
+        return None
+    segments = parts[app_idx + 1 : -1]
+    out: list[str] = []
+    for seg in segments:
+        if seg.startswith("(") and seg.endswith(")"):
+            continue
+        if seg.startswith("@"):
+            continue
+        if seg.startswith("[[...") and seg.endswith("]]"):
+            out.append("*" + seg[5:-2])
+        elif seg.startswith("[...") and seg.endswith("]"):
+            out.append("*" + seg[4:-1])
+        elif seg.startswith("[") and seg.endswith("]"):
+            out.append(":" + seg[1:-1])
+        else:
+            out.append(seg)
+    return "/" + "/".join(out) if out else "/"
+
+
 def _route_from_decorator(dec: ast.expr) -> Optional[tuple[str, str, str]]:
     """If decorator looks like a route, return (framework, method, path)."""
     if not isinstance(dec, ast.Call):
@@ -986,6 +1028,25 @@ def _index_generic(conn, file_id: int, path: Path, language: str) -> None:
                 candidate.name,
             ):
                 _insert_call(conn, file_id, sym_id, call_name, line_no)
+
+    # Next.js App Router: file path + HTTP-method exports define the route.
+    if language in {"javascript", "typescript"}:
+        next_path = _next_app_route_path(path)
+        if next_path is not None:
+            for candidate, sym_id in inserted:
+                if (
+                    candidate.kind in CALLABLE_KINDS
+                    and candidate.name in NEXT_HTTP_METHODS
+                ):
+                    _insert_route(
+                        conn,
+                        file_id,
+                        "next-app",
+                        candidate.name,
+                        next_path,
+                        sym_id,
+                        candidate.start_line,
+                    )
 
     for line_no, line in enumerate(lines, start=1):
         route = _route_from_text(line, language)
