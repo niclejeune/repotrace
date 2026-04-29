@@ -16,9 +16,73 @@ def _is_test_file(path: str) -> bool:
     )
 
 
+# Token-based search: short / common words that should not drive matching.
+_STOP_WORDS = {
+    "the", "and", "for", "with", "from", "into", "that", "this", "than",
+    "use", "uses", "using", "api", "new", "get", "set", "any", "all",
+    "when", "where", "what", "how", "why", "who", "are", "you", "your",
+    "handle", "handler", "handlers", "function", "method", "class",
+    "feature", "support", "supports", "work", "works", "endpoint",
+    "endpoints",
+}
+
+
+def _tokenize_query(query: str) -> list[str]:
+    """Lowercase, split on non-word boundaries, drop short or stop-list tokens."""
+    import re
+    raw = re.split(r"[^A-Za-z0-9_]+", query.lower())
+    return [t for t in raw if len(t) >= 3 and t not in _STOP_WORDS]
+
+
+def _multi_find(repo_root: Path, query: str, limit: int = 12) -> list[dict]:
+    """Multi-token symbol search.
+
+    Tries the existing whole-string LIKE first (preserves prior behavior for
+    exact / single-word queries). If it returns nothing, splits the query into
+    tokens and aggregates per-token hits, ranking by:
+      1. number of distinct tokens matched (descending)
+      2. exact name match bonus
+      3. production over tests
+      4. shorter symbol name (current find tiebreaker)
+    """
+    direct = queries.find(repo_root, query, limit=limit)
+    if direct:
+        return direct
+    tokens = _tokenize_query(query)
+    if not tokens:
+        return []
+    by_key: dict[tuple, dict] = {}
+    for tok in tokens:
+        for m in queries.find(repo_root, tok, limit=30):
+            key = (m["file"], m["name"], m["lines"])
+            entry = by_key.get(key)
+            if entry is None:
+                entry = dict(m)
+                entry["_hits"] = 0
+                entry["_exact"] = 0
+                by_key[key] = entry
+            entry["_hits"] += 1
+            if m["name"].lower() == tok:
+                entry["_exact"] += 1
+    ranked = sorted(
+        by_key.values(),
+        key=lambda e: (
+            -e["_hits"],
+            -e["_exact"],
+            1 if _is_test_file(e["file"]) else 0,
+            len(e["name"]),
+            e["name"],
+        ),
+    )
+    return [
+        {k: v for k, v in r.items() if not k.startswith("_")}
+        for r in ranked[:limit]
+    ]
+
+
 def build_context(repo_root: Path, query: str, max_files: int = 6) -> str:
     """Return a markdown context bundle for `query`."""
-    matches = queries.find(repo_root, query, limit=12)
+    matches = _multi_find(repo_root, query, limit=12)
 
     # group by file, keep best symbol per file
     by_file: dict[str, list[dict]] = {}
